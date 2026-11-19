@@ -2,7 +2,7 @@
 name = "localmind"
 version = "0.1.0"
 edition = "2021"
-description = "Local semantic search engine in Rust — BERT embeddings, binary index, SIMD search, polling monitor, TUI"
+description = "Local semantic search engine in Rust — BERT embeddings, binary index, SIMD search, CLI"
 repository = "https://github.com/Gabriele06-local/LocalMind"
 license = "MIT"
 keywords = ["search", "semantic-search", "bert", "rust", "nlp"]
@@ -17,15 +17,10 @@ anyhow = "1"
 serde_json = "1"
 memmap2 = "0.9"
 rayon = "1"
-blake3 = "1"
-ratatui = "0.30"
-crossterm = "0.29"
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 thiserror = "1"
 wide = "1.5"
 pdf-extract = "0.12"
 zip = "8"
-syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 
 [profile.release]
 lto = true

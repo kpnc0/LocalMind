@@ -1,309 +1,294 @@
-mod bm25;
 mod embed;
 mod extract;
 mod index;
-mod monitor;
 mod search;
-mod tui;
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-
+use std::path::{Path, PathBuf};
 use anyhow::Result;
+use rayon::prelude::*;
+
 use embed::Embedder;
+use extract::extract_text;
 use index::Index;
-use monitor::LiveIndex;
 use search::top_k;
 
-fn wait_count(live: &LiveIndex, min: usize) -> usize {
-    let start = Instant::now();
-    loop {
-        let n = live.get_index().read().unwrap().len() as usize;
-        if n >= min || start.elapsed() > Duration::from_secs(30) {
-            return n;
+fn get_home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("USERPROFILE").map(PathBuf::from))
+        .unwrap_or_else(|_| PathBuf::from("/root"))
+}
+
+fn find_database() -> Option<PathBuf> {
+    let home_db = get_home_dir().join(".localmind").join("index.bin");
+    let tmp_db = PathBuf::from("/tmp/localmind_watch/index.bin");
+
+    match (home_db.exists(), tmp_db.exists()) {
+        (true, true) => {
+            let mtime_home = std::fs::metadata(&home_db).and_then(|m| m.modified()).ok();
+            let mtime_tmp = std::fs::metadata(&tmp_db).and_then(|m| m.modified()).ok();
+            if let (Some(th), Some(tt)) = (mtime_home, mtime_tmp) {
+                if tt > th {
+                    Some(tmp_db)
+                } else {
+                    Some(home_db)
+                }
+            } else {
+                Some(home_db)
+            }
         }
-        std::thread::sleep(Duration::from_millis(500));
+        (true, false) => Some(home_db),
+        (false, true) => Some(tmp_db),
+        (false, false) => None,
     }
 }
 
-fn wait_count_eq(live: &LiveIndex, target: usize) -> usize {
-    let start = Instant::now();
-    loop {
-        let n = live.get_index().read().unwrap().len() as usize;
-        if n == target || start.elapsed() > Duration::from_secs(30) {
-            return n;
-        }
-        std::thread::sleep(Duration::from_millis(500));
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
     }
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if name.starts_with('.') || name.ends_with(".tmp") || name.ends_with(".swp") || name == "index.bin" {
+            continue;
+        }
+        if path.is_dir() {
+            collect_files(&path, out)?;
+        } else if path.is_file() {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            let ignored_exts = [
+                "bin", "exe", "png", "jpg", "jpeg", "gif", "webp", "zip", "tar", "gz",
+                "bz2", "7z", "so", "dylib", "dll", "o", "a", "pyc", "class",
+            ];
+            if !ignored_exts.contains(&ext.as_str()) {
+                out.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn index_directory(dir: &Path, embedder: &Embedder) -> Result<(Vec<Vec<f32>>, Vec<String>)> {
+    let mut files = Vec::new();
+    collect_files(dir, &mut files)?;
+    if files.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    files.sort();
+
+    let records: Vec<Result<(String, Vec<f32>)>> = files
+        .par_iter()
+        .filter_map(|p| {
+            let path_str = p.to_string_lossy().to_string();
+            let text = match extract_text(p) {
+                Ok(t) => t,
+                Err(_) => return None,
+            };
+            let text = text.trim();
+            let emb_res = if text.is_empty() {
+                Ok(vec![0.0f32; 384])
+            } else if text.len() > 10000 {
+                embedder.embed_chunked(text)
+            } else {
+                embedder.embed(text)
+            };
+            Some(emb_res.map(|emb| (path_str, emb)))
+        })
+        .collect();
+
+    let mut vectors = Vec::with_capacity(records.len());
+    let mut paths = Vec::with_capacity(records.len());
+    for r in records {
+        let (path, emb) = r?;
+        paths.push(path);
+        vectors.push(emb);
+    }
+
+    Ok((vectors, paths))
+}
+
+fn run_index(embedder: &Embedder) -> Result<()> {
+    let watch_dir = PathBuf::from("/tmp/localmind_watch");
+    if !watch_dir.exists() {
+        std::fs::create_dir_all(&watch_dir)?;
+    }
+    println!("Indexing files in {}...", watch_dir.display());
+    let (vectors, paths) = index_directory(&watch_dir, embedder)?;
+    if paths.is_empty() {
+        println!("No files found in {} to index.", watch_dir.display());
+        return Ok(());
+    }
+    let count = paths.len();
+    let tmp_db = watch_dir.join("index.bin");
+    Index::save(&tmp_db, 384, &vectors, &paths)?;
+    println!("Successfully indexed {} file(s) into {}", count, tmp_db.display());
+    Ok(())
+}
+
+fn run_save(embedder: &Embedder) -> Result<()> {
+    let localmind_dir = get_home_dir().join(".localmind");
+    std::fs::create_dir_all(&localmind_dir)?;
+    let save_path = localmind_dir.join("index.bin");
+    let tmp_db = PathBuf::from("/tmp/localmind_watch/index.bin");
+
+    if tmp_db.exists() {
+        std::fs::copy(&tmp_db, &save_path)?;
+        let index = Index::open(&save_path)?;
+        println!("Saved database to {} ({} records)", save_path.display(), index.len());
+    } else {
+        let watch_dir = PathBuf::from("/tmp/localmind_watch");
+        if !watch_dir.exists() {
+            std::fs::create_dir_all(&watch_dir)?;
+        }
+        println!("Indexing files in {}...", watch_dir.display());
+        let (vectors, paths) = index_directory(&watch_dir, embedder)?;
+        if paths.is_empty() {
+            println!("No files found in {} to save.", watch_dir.display());
+            return Ok(());
+        }
+        let count = paths.len();
+        Index::save(&tmp_db, 384, &vectors, &paths)?;
+        Index::save(&save_path, 384, &vectors, &paths)?;
+        println!("Saved database to {} ({} records)", save_path.display(), count);
+    }
+    Ok(())
+}
+
+fn run_index_and_save(embedder: &Embedder) -> Result<()> {
+    let watch_dir = PathBuf::from("/tmp/localmind_watch");
+    if !watch_dir.exists() {
+        std::fs::create_dir_all(&watch_dir)?;
+    }
+    println!("Indexing files in {}...", watch_dir.display());
+    let (vectors, paths) = index_directory(&watch_dir, embedder)?;
+    if paths.is_empty() {
+        println!("No files found in {} to index.", watch_dir.display());
+        return Ok(());
+    }
+    let count = paths.len();
+    let tmp_db = watch_dir.join("index.bin");
+    Index::save(&tmp_db, 384, &vectors, &paths)?;
+
+    let localmind_dir = get_home_dir().join(".localmind");
+    std::fs::create_dir_all(&localmind_dir)?;
+    let save_path = localmind_dir.join("index.bin");
+    Index::save(&save_path, 384, &vectors, &paths)?;
+
+    println!(
+        "Successfully indexed {} file(s) into {} and saved to {}",
+        count,
+        tmp_db.display(),
+        save_path.display()
+    );
+    Ok(())
+}
+
+fn run_search(embedder: &Embedder, query: &str, show_scores: bool) -> Result<()> {
+    let db_path = match find_database() {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: No database found. Please run 'localmind --index' first.");
+            std::process::exit(1);
+        }
+    };
+
+    let index = Index::open(&db_path)?;
+    if index.len() == 0 {
+        println!("Database is empty.");
+        return Ok(());
+    }
+
+    let query_vec = embedder.embed(query)?;
+    let all_results = top_k(&index, &query_vec, index.len() as usize);
+
+    let positive_results: Vec<_> = all_results.into_iter().filter(|r| r.score > 0.0).collect();
+    let results = if positive_results.is_empty() && index.len() > 0 {
+        top_k(&index, &query_vec, 1)
+    } else {
+        positive_results
+    };
+
+    if results.is_empty() {
+        println!("No results found.");
+    } else {
+        for r in &results {
+            if show_scores {
+                println!("[{:.4}] {}", r.score, r.path);
+            } else {
+                println!("{}", r.path);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn print_usage() {
+    println!("LocalMind — Local semantic search CLI
+
+USAGE:
+    localmind --index              Index files in /tmp/localmind_watch into a database
+    localmind --save               Save database to ~/.localmind directory
+    localmind search <query>       Search indexed files for <query>
+
+OPTIONS:
+    --index                        Index files in /tmp/localmind_watch
+    --save                         Save database to ~/.localmind directory
+    --scores                       Show similarity scores in search results
+    -h, --help                     Print help information
+");
 }
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    let is_demo = args.get(1).map(|s| s == "--demo").unwrap_or(false);
-
-    let embedder = Embedder::new()?;
-    let embedder = Arc::new(embedder);
-
-    if is_demo {
-        return demo(embedder);
+    if args.len() < 2 {
+        print_usage();
+        return Ok(());
     }
 
-    let (progress_tx, progress_rx) = std::sync::mpsc::channel();
-    let watch_dir = std::env::temp_dir().join("localmind_watch");
-    let _ = std::fs::create_dir_all(&watch_dir);
-    let index_path = watch_dir.join("index.bin");
-    let live = LiveIndex::new(watch_dir.clone(), index_path, embedder.clone(), Some(progress_tx))?;
-    let index = live.get_index();
-    let bm25 = live.get_bm25();
-
-    tui::run(embedder, index, bm25, progress_rx)
-}
-
-fn demo(embedder: Arc<Embedder>) -> Result<()> {
-    // ── Step 1: Embedding ──
-    println!("=== Step 1: Embedding ===");
-    let text = "This is a test sentence for embedding.";
-    let t0 = Instant::now();
-    let vec = embedder.embed(text)?;
-    let t1 = Instant::now();
-    println!("Dimension: {}", vec.len());
-    println!("First 5 values: {:?}", &vec[..5]);
-    println!("L2 norm: {:.6}", vec.iter().map(|x| x * x).sum::<f32>().sqrt());
-    println!("Embed latency: {:.3}s", (t1 - t0).as_secs_f32());
-
-    let t0 = Instant::now();
-    let _ = embedder.embed("short text")?;
-    let t1 = Instant::now();
-    println!("Short embed latency: {:.3}s", (t1 - t0).as_secs_f32());
-
-    // ── Step 2: Binary Index ──
-    println!("\n=== Step 2: Binary Index ===");
-    let vectors = vec![
-        vec![0.1f32, 0.2, 0.3],
-        vec![0.4f32, 0.5, 0.6],
-        vec![0.7f32, 0.8, 0.9],
-    ];
-    let paths = vec![
-        "/doc/a.txt".to_string(),
-        "/doc/b.txt".to_string(),
-        "/doc/c.txt".to_string(),
-    ];
-
-    let index_path = std::env::temp_dir().join("test_index.bin");
-    Index::save(&index_path, 3, &vectors, &paths)?;
-    let index = Index::open(&index_path)?;
-
-    println!("Records: {}", index.len());
-    println!("Dim: {}", index.dim());
-    for i in 0..index.len() {
-        let v = index.vector(i);
-        let p = index.path(i);
-        println!("  [{}] path={:?} vec={:?}", i, p, v);
+    let has_help = args.iter().any(|a| a == "-h" || a == "--help");
+    if has_help {
+        print_usage();
+        return Ok(());
     }
 
-    // ── Step 3: Search (top-k) ──
-    println!("\n=== Step 3: Search (top-2) ===");
-    fn normalize(v: &mut [f32]) {
-        let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        for x in v.iter_mut() {
-            *x /= n;
+    let has_index = args.iter().any(|a| a == "--index" || a == "-i");
+    let has_save = args.iter().any(|a| a == "--save");
+    let show_scores = args.iter().any(|a| a == "--scores" || a == "--score");
+
+    let search_idx = args.iter().position(|a| a == "search" || a == "--search" || a == "-s");
+
+    if let Some(pos) = search_idx {
+        let query_tokens: Vec<&str> = args[pos + 1..]
+            .iter()
+            .filter(|a| !a.starts_with('-'))
+            .map(|s| s.as_str())
+            .collect();
+
+        if query_tokens.is_empty() {
+            eprintln!("Error: Missing query string for search.");
+            std::process::exit(1);
+        }
+
+        let query = query_tokens.join(" ");
+        let embedder = Embedder::new()?;
+        return run_search(&embedder, &query, show_scores);
+    }
+
+    if has_index || has_save {
+        let embedder = Embedder::new()?;
+        if has_index && has_save {
+            return run_index_and_save(&embedder);
+        } else if has_index {
+            return run_index(&embedder);
+        } else if has_save {
+            return run_save(&embedder);
         }
     }
-    let mut query = vec![0.35f32, 0.45, 0.55];
-    normalize(&mut query);
-    let t0 = Instant::now();
-    let results = top_k(&index, &query, 2);
-    let t1 = Instant::now();
-    println!("Search latency (3 records): {:.6}s", (t1 - t0).as_secs_f32());
-    for r in &results {
-        println!("  score={:.4} path={}", r.score, r.path);
-    }
 
-    // ── Step 3b: End-to-end (embed + index + search) ──
-    println!("\n=== Step 3b: End-to-end ===");
-    let docs = [
-        "The cat sits outside",
-        "A man is playing guitar",
-        "I love pasta",
-        "Pizza is the best food",
-        "The cat plays in the garden",
-        "A woman watches TV",
-        "The new movie is awesome",
-        "Do you like pizza?",
-    ];
-    let doc_paths: Vec<String> = docs
-        .iter()
-        .enumerate()
-        .map(|(i, _)| format!("/doc/{}.txt", i))
-        .collect();
-    let doc_vectors: Vec<Vec<f32>> = docs
-        .iter()
-        .map(|d| embedder.embed(d).unwrap())
-        .collect();
-
-    let e2e_path = std::env::temp_dir().join("e2e_index.bin");
-    Index::save(&e2e_path, 384, &doc_vectors, &doc_paths)?;
-    let e2e_index = Index::open(&e2e_path)?;
-
-    let t0 = Instant::now();
-    let q_emb = embedder.embed("food and cooking")?;
-    let t1 = Instant::now();
-    let e2e_results = top_k(&e2e_index, &q_emb, 3);
-    let t2 = Instant::now();
-    println!("Query: \"food and cooking\"");
-    println!("  Embed: {:.3}s, Search (8 records): {:.6}s",
-        (t1 - t0).as_secs_f32(), (t2 - t1).as_secs_f32());
-    for r in &e2e_results {
-        println!("  score={:.4} path={}", r.score, r.path);
-    }
-    // Semantic sanity: top result should be pizza-related
-    assert!(e2e_results[0].path.contains("/doc/3.txt") || e2e_results[0].path.contains("/doc/7.txt"),
-        "Expected pizza-related doc as top result");
-
-    // ── Step 4: Live Monitor + Edge Cases ──
-    println!("\n=== Step 4: Live Monitor ===");
-    let watch_dir = std::env::temp_dir().join("localmind_watch");
-    let _ = std::fs::remove_dir_all(&watch_dir);
-    std::fs::create_dir_all(&watch_dir)?;
-
-    let live_index_path = watch_dir.join("index.bin");
-    let live = LiveIndex::new(watch_dir.clone(), live_index_path, embedder.clone(), None)?;
-
-    // 4a: Create and verify
-    println!("\n-- 4a: Create file --");
-    let test_file = watch_dir.join("hello.txt");
-    std::fs::write(&test_file, "Hello world, this is a test document for embedding.")?;
-    let n = wait_count(&live, 1);
-    println!("After create: {n} records");
-    assert_eq!(n, 1, "create should produce 1 record");
-
-    let t0 = Instant::now();
-    let q_greetings = embedder.embed("greetings")?;
-    let results = live.search(&q_greetings, 5);
-    let t1 = Instant::now();
-    println!("Search \"greetings\": {:.3}s", (t1 - t0).as_secs_f32());
-    for r in &results {
-        println!("  score={:.4} path={}", r.score, r.path);
-    }
-    assert!(!results.is_empty(), "should find the hello file");
-
-    // 4b: Modify and verify
-    println!("\n-- 4b: Modify file --");
-    std::fs::write(&test_file, "Goodbye everyone, this document was updated.")?;
-    let n = wait_count(&live, 1);
-    println!("After modify: {n} records");
-    let q_goodbye = embedder.embed("farewell")?;
-    let results = live.search(&q_goodbye, 5);
-    println!("Search \"farewell\":");
-    for r in &results {
-        println!("  score={:.4} path={}", r.score, r.path);
-    }
-
-    // 4c: Delete and verify
-    println!("\n-- 4c: Delete file --");
-    std::fs::remove_file(&test_file)?;
-    let n = wait_count_eq(&live, 0);
-    println!("After delete: {n} records");
-    assert_eq!(n, 0, "delete should yield 0 records");
-
-    // 4d: Empty file
-    println!("\n-- 4d: Empty file --");
-    let empty_file = watch_dir.join("empty.txt");
-    std::fs::write(&empty_file, "")?;
-    let n = wait_count(&live, 1);
-    println!("Empty file: {n} records");
-    assert_eq!(n, 1);
-    // Search with empty vector should still return the record (score 0)
-    let results = live.search(&embedder.embed("something")?, 5);
-    println!("Search after adding empty file: {} results", results.len());
-    // Clean up empty file and wait for propagation
-    std::fs::remove_file(&empty_file)?;
-    let n = wait_count_eq(&live, 0);
-    println!("Empty file removed: {n} records");
-
-    // 4e: Unicode / emoji
-    println!("\n-- 4e: Unicode & emoji --");
-    let multi_file = watch_dir.join("multilingual.txt");
-    let multi_text = "Ciao mondo! 🍕 Pizza è la migliore 😊 こんにちは";
-    std::fs::write(&multi_file, multi_text)?;
-    let n = wait_count(&live, 1);
-    println!("Unicode file: {n} records");
-
-    // Diagnostic: check what tokens the tokenizer produces
-    let enc = embedder.tokenize(multi_text)?;
-    let ids = enc.get_ids();
-    let tokens: Vec<String> = ids.iter()
-        .take(16)
-        .map(|&id| embedder.id_to_token(id).unwrap_or_else(|| format!("[ID:{id}]")))
-        .collect();
-    let unk_count = ids.iter().filter(|&&id| id == 100).count(); // 100 = [UNK]
-    println!("  Text: \"{multi_text}\"");
-    println!("  Tokens: {} total, {unk_count} [UNK], first 16: {tokens:?}", ids.len());
-
-    let q = embedder.embed("pizza")?;
-    let results = live.search(&q, 5);
-    println!("Search \"pizza\": {} results, top score={:.4}",
-        results.len(), results.first().map(|r| r.score).unwrap_or(0.0));
-    if let Some(top) = results.first() {
-        println!("  top path: {}", top.path);
-    }
-
-    // 4f: 5-file batch stress test (embedding is ~1.5s/file)
-    println!("\n-- 4f: 5-file batch --");
-    let topics = [
-        "machine learning",
-        "pizza recipes",
-        "cat behavior",
-        "solar system",
-        "classical music",
-    ];
-    let batch_dir = watch_dir.join("batch");
-    std::fs::create_dir_all(&batch_dir)?;
-    for (i, topic) in topics.iter().enumerate() {
-        std::fs::write(batch_dir.join(format!("{i:02}_{}.txt", topic.replace(' ', "_"))),
-            format!("This document is about {topic}. {topic} is a fascinating subject with many applications."))?;
-    }
-    // Wait for 5 batch files + multilingual.txt = 6
-    let n = wait_count(&live, 5);
-    println!("After batch create: {n} records (expected >= 5)");
-
-    // Measure full search latency across all indexed docs
-    let queries = ["machine learning", "pizza", "cat", "music", "space"];
-    let mut total_search = 0.0f64;
-    for q_str in &queries {
-        let t0 = Instant::now();
-        let q = embedder.embed(q_str)?;
-        let results = live.search(&q, 5);
-        let t1 = Instant::now();
-        let lat = (t1 - t0).as_secs_f64();
-        total_search += lat;
-        println!("  \"{q_str}\": {lat:.4}s — top: {}",
-            results.first().map(|r| &r.path).unwrap_or(&"-".into()));
-    }
-    println!("Search avg ({} docs): {:.4}s", n, total_search / queries.len() as f64);
-
-    // 4g: Chunking — verify long file ranking is not penalized
-    println!("\n-- 4g: Chunking quality --");
-    let long_text = format!("Pizza margherita is a traditional Italian pizza. {} ",
-        "It has tomatoes, mozzarella, and basil. ").repeat(2000);
-    std::fs::write(watch_dir.join("long_pizza.txt"), &long_text)?;
-    // Wait for 7 total records (5 batch + multilingual + long_pizza)
-    let n = wait_count(&live, 7);
-    println!("Long file indexed: {n} total records");
-
-    let q = embedder.embed("margherita pizza")?;
-    let results = live.search(&q, 5);
-    println!("Search \"margherita pizza\":");
-    for r in &results {
-        println!("  score={:.4} path={}", r.score, r.path);
-    }
-    // Long pizza file should be in top results, not artificially low
-    let long_in_top = results.iter().any(|r| r.path.contains("long_pizza"));
-    let check = if long_in_top { "passed" } else { "FAILED — check renormalization" };
-    println!("Long pizza in top 5: {check}");
-
-    // Cleanup
-    let _ = std::fs::remove_dir_all(&watch_dir);
-    println!("\n=== All demo steps passed ===");
+    print_usage();
     Ok(())
 }
