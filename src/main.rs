@@ -14,6 +14,7 @@ use extract::extract_text;
 use index::Index;
 use search::top_k;
 use snippet::extract_snippet;
+use std::io::{self, Write};
 
 fn get_home_dir() -> PathBuf {
     std::env::var("HOME")
@@ -258,6 +259,9 @@ fn run_search(embedder: &Embedder, query: &str, plain: bool, use_color: bool) ->
         }
     };
 
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+
     let index = Index::open(&db_path)?;
     if index.len() == 0 {
         println!("Database is empty.");
@@ -284,9 +288,14 @@ fn run_search(embedder: &Embedder, query: &str, plain: bool, use_color: bool) ->
             println!("{}", r.path);
         } else {
             if use_color {
-                println!("\x1b[1;36m[{:.4}]\x1b[0m \x1b[1m{}\x1b[0m", r.score, r.path);
+                if writeln!(out, "\x1b[1;36m[{:.4}]\x1b[0m \x1b[1m{}\x1b[0m", r.score, r.path).is_err() {
+                    break; // reader
+                }
             } else {
-                println!("[{:.4}] {}", r.score, r.path);
+                if writeln!(out, "[{:.4}] {}", r.score, r.path).is_err() {
+                    break;
+                }
+
             }
 
         }
