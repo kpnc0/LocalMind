@@ -289,9 +289,6 @@ fn run_search(embedder: &Embedder, query: &str, plain: bool, use_color: bool) ->
                 println!("[{:.4}] {}", r.score, r.path);
             }
 
-            if let Some(snippet) = extract_snippet(Path::new(&r.path), query, use_color) {
-                print!("{}", snippet);
-            }
         }
     }
 
