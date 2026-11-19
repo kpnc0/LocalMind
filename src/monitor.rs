@@ -157,7 +157,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
             collect_files(&path, out)?;
         } else if path.is_file() {
             let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if matches!(ext, "txt" | "pdf" | "docx" | "doc") {
+            if matches!(ext, "txt" | "pdf" | "docx" | "doc" | "md") {
                 out.push(path);
             }
         }
