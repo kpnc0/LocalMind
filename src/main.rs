@@ -2,7 +2,9 @@ mod embed;
 mod extract;
 mod index;
 mod search;
+mod snippet;
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use anyhow::Result;
 use rayon::prelude::*;
@@ -11,6 +13,7 @@ use embed::Embedder;
 use extract::extract_text;
 use index::Index;
 use search::top_k;
+use snippet::extract_snippet;
 
 fn get_home_dir() -> PathBuf {
     std::env::var("HOME")
@@ -70,19 +73,60 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
-fn index_directory(dir: &Path, embedder: &Embedder) -> Result<(Vec<Vec<f32>>, Vec<String>)> {
+fn index_directory(
+    dir: &Path,
+    embedder: &Embedder,
+    existing_index: Option<&Index>,
+) -> Result<(Vec<Vec<f32>>, Vec<String>, Vec<u64>, Vec<u64>, usize, usize)> {
     let mut files = Vec::new();
     collect_files(dir, &mut files)?;
     if files.is_empty() {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), 0, 0));
     }
 
     files.sort();
 
-    let records: Vec<Result<(String, Vec<f32>)>> = files
-        .par_iter()
-        .filter_map(|p| {
-            let path_str = p.to_string_lossy().to_string();
+    let cache = existing_index
+        .map(|idx| idx.get_cached_records())
+        .unwrap_or_default();
+
+    let mut tasks = Vec::new();
+    let mut reused_count = 0;
+
+    for p in &files {
+        let path_str = p.to_string_lossy().to_string();
+        let meta = match std::fs::metadata(p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = meta
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let file_size = meta.len();
+
+        if let Some((cached_mtime, cached_size, cached_vec)) = cache.get(&path_str) {
+            if *cached_mtime == mtime && *cached_size == file_size {
+                reused_count += 1;
+                tasks.push((path_str, mtime, file_size, Some(cached_vec.clone())));
+                continue;
+            }
+        }
+
+        tasks.push((path_str, mtime, file_size, None));
+    }
+
+    // Embed only new or modified files in parallel
+    let processed: Vec<Result<(String, u64, u64, Vec<f32>)>> = tasks
+        .into_par_iter()
+        .filter_map(|(path_str, mtime, size, cached_vec)| {
+            if let Some(v) = cached_vec {
+                return Some(Ok((path_str, mtime, size, v)));
+            }
+
+            let p = Path::new(&path_str);
             let text = match extract_text(p) {
                 Ok(t) => t,
                 Err(_) => return None,
@@ -95,19 +139,25 @@ fn index_directory(dir: &Path, embedder: &Embedder) -> Result<(Vec<Vec<f32>>, Ve
             } else {
                 embedder.embed(text)
             };
-            Some(emb_res.map(|emb| (path_str, emb)))
+            Some(emb_res.map(|emb| (path_str, mtime, size, emb)))
         })
         .collect();
 
-    let mut vectors = Vec::with_capacity(records.len());
-    let mut paths = Vec::with_capacity(records.len());
-    for r in records {
-        let (path, emb) = r?;
-        paths.push(path);
-        vectors.push(emb);
+    let mut vectors = Vec::with_capacity(processed.len());
+    let mut paths = Vec::with_capacity(processed.len());
+    let mut mtimes = Vec::with_capacity(processed.len());
+    let mut file_sizes = Vec::with_capacity(processed.len());
+
+    for r in processed {
+        let (p, m, s, v) = r?;
+        paths.push(p);
+        mtimes.push(m);
+        file_sizes.push(s);
+        vectors.push(v);
     }
 
-    Ok((vectors, paths))
+    let newly_embedded = paths.len() - reused_count;
+    Ok((vectors, paths, mtimes, file_sizes, reused_count, newly_embedded))
 }
 
 fn run_index(embedder: &Embedder) -> Result<()> {
@@ -115,16 +165,24 @@ fn run_index(embedder: &Embedder) -> Result<()> {
     if !watch_dir.exists() {
         std::fs::create_dir_all(&watch_dir)?;
     }
+    let tmp_db = watch_dir.join("index.bin");
+    let existing_index = Index::open(&tmp_db).ok();
+
     println!("Indexing files in {}...", watch_dir.display());
-    let (vectors, paths) = index_directory(&watch_dir, embedder)?;
+    let (vectors, paths, mtimes, file_sizes, reused, embedded) =
+        index_directory(&watch_dir, embedder, existing_index.as_ref())?;
+
     if paths.is_empty() {
         println!("No files found in {} to index.", watch_dir.display());
         return Ok(());
     }
+
     let count = paths.len();
-    let tmp_db = watch_dir.join("index.bin");
-    Index::save(&tmp_db, 384, &vectors, &paths)?;
-    println!("Successfully indexed {} file(s) into {}", count, tmp_db.display());
+    Index::save(&tmp_db, 384, &vectors, &paths, &mtimes, &file_sizes)?;
+    println!(
+        "Successfully indexed {} file(s) ({} reused, {} newly embedded) into {}",
+        count, reused, embedded, tmp_db.display()
+    );
     Ok(())
 }
 
@@ -144,14 +202,16 @@ fn run_save(embedder: &Embedder) -> Result<()> {
             std::fs::create_dir_all(&watch_dir)?;
         }
         println!("Indexing files in {}...", watch_dir.display());
-        let (vectors, paths) = index_directory(&watch_dir, embedder)?;
+        let (vectors, paths, mtimes, file_sizes, _, _) =
+            index_directory(&watch_dir, embedder, None)?;
+
         if paths.is_empty() {
             println!("No files found in {} to save.", watch_dir.display());
             return Ok(());
         }
         let count = paths.len();
-        Index::save(&tmp_db, 384, &vectors, &paths)?;
-        Index::save(&save_path, 384, &vectors, &paths)?;
+        Index::save(&tmp_db, 384, &vectors, &paths, &mtimes, &file_sizes)?;
+        Index::save(&save_path, 384, &vectors, &paths, &mtimes, &file_sizes)?;
         println!("Saved database to {} ({} records)", save_path.display(), count);
     }
     Ok(())
@@ -162,31 +222,34 @@ fn run_index_and_save(embedder: &Embedder) -> Result<()> {
     if !watch_dir.exists() {
         std::fs::create_dir_all(&watch_dir)?;
     }
+    let tmp_db = watch_dir.join("index.bin");
+    let existing_index = Index::open(&tmp_db).ok();
+
     println!("Indexing files in {}...", watch_dir.display());
-    let (vectors, paths) = index_directory(&watch_dir, embedder)?;
+    let (vectors, paths, mtimes, file_sizes, reused, embedded) =
+        index_directory(&watch_dir, embedder, existing_index.as_ref())?;
+
     if paths.is_empty() {
         println!("No files found in {} to index.", watch_dir.display());
         return Ok(());
     }
+
     let count = paths.len();
-    let tmp_db = watch_dir.join("index.bin");
-    Index::save(&tmp_db, 384, &vectors, &paths)?;
+    Index::save(&tmp_db, 384, &vectors, &paths, &mtimes, &file_sizes)?;
 
     let localmind_dir = get_home_dir().join(".localmind");
     std::fs::create_dir_all(&localmind_dir)?;
     let save_path = localmind_dir.join("index.bin");
-    Index::save(&save_path, 384, &vectors, &paths)?;
+    Index::save(&save_path, 384, &vectors, &paths, &mtimes, &file_sizes)?;
 
     println!(
-        "Successfully indexed {} file(s) into {} and saved to {}",
-        count,
-        tmp_db.display(),
-        save_path.display()
+        "Successfully indexed {} file(s) ({} reused, {} embedded) into {} and saved to {}",
+        count, reused, embedded, tmp_db.display(), save_path.display()
     );
     Ok(())
 }
 
-fn run_search(embedder: &Embedder, query: &str, show_scores: bool) -> Result<()> {
+fn run_search(embedder: &Embedder, query: &str, plain: bool, use_color: bool) -> Result<()> {
     let db_path = match find_database() {
         Some(p) => p,
         None => {
@@ -213,12 +276,21 @@ fn run_search(embedder: &Embedder, query: &str, show_scores: bool) -> Result<()>
 
     if results.is_empty() {
         println!("No results found.");
-    } else {
-        for r in &results {
-            if show_scores {
-                println!("[{:.4}] {}", r.score, r.path);
+        return Ok(());
+    }
+
+    for r in &results {
+        if plain {
+            println!("{}", r.path);
+        } else {
+            if use_color {
+                println!("\x1b[1;36m[{:.4}]\x1b[0m \x1b[1m{}\x1b[0m", r.score, r.path);
             } else {
-                println!("{}", r.path);
+                println!("[{:.4}] {}", r.score, r.path);
+            }
+
+            if let Some(snippet) = extract_snippet(Path::new(&r.path), query, use_color) {
+                print!("{}", snippet);
             }
         }
     }
@@ -232,12 +304,13 @@ fn print_usage() {
 USAGE:
     localmind --index              Index files in /tmp/localmind_watch into a database
     localmind --save               Save database to ~/.localmind directory
-    localmind search <query>       Search indexed files for <query>
+    localmind search <query>       Search indexed files with colorful snippets
 
 OPTIONS:
-    --index                        Index files in /tmp/localmind_watch
+    --index                        Index files in /tmp/localmind_watch (incremental)
     --save                         Save database to ~/.localmind directory
-    --scores                       Show similarity scores in search results
+    -p, --plain                    Output only file paths (for piping into xargs/fzf)
+    --no-color                     Disable ANSI color formatting
     -h, --help                     Print help information
 ");
 }
@@ -257,7 +330,9 @@ fn main() -> Result<()> {
 
     let has_index = args.iter().any(|a| a == "--index" || a == "-i");
     let has_save = args.iter().any(|a| a == "--save");
-    let show_scores = args.iter().any(|a| a == "--scores" || a == "--score");
+    let plain = args.iter().any(|a| a == "--plain" || a == "-p");
+    let no_color = args.iter().any(|a| a == "--no-color");
+    let use_color = std::io::stdout().is_terminal() && !no_color && !plain;
 
     let search_idx = args.iter().position(|a| a == "search" || a == "--search" || a == "-s");
 
@@ -275,7 +350,7 @@ fn main() -> Result<()> {
 
         let query = query_tokens.join(" ");
         let embedder = Embedder::new()?;
-        return run_search(&embedder, &query, show_scores);
+        return run_search(&embedder, &query, plain, use_color);
     }
 
     if has_index || has_save {

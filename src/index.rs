@@ -1,11 +1,12 @@
 use anyhow::Result;
 use memmap2::Mmap;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 use thiserror::Error;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const ALIGN: usize = 8;
 
 #[derive(Debug, Error)]
@@ -14,7 +15,7 @@ pub enum IndexError {
     Io(#[from] std::io::Error),
     #[error("invalid magic bytes")]
     InvalidMagic,
-    #[error("unsupported version {version}, expected {expected}")]
+    #[error("unsupported version {version}, expected 1 or {expected}")]
     UnsupportedVersion { version: u32, expected: u32 },
 }
 
@@ -22,6 +23,7 @@ pub struct Index {
     mmap: Mmap,
     num_records: u32,
     dim: u32,
+    version: u32,
 }
 
 #[repr(C)]
@@ -33,10 +35,21 @@ struct Header {
 }
 
 #[repr(C)]
-struct Entry {
+#[derive(Clone, Copy)]
+struct EntryV1 {
     offset: u64,
     len: u32,
     _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct EntryV2 {
+    offset: u64,
+    len: u32,
+    _pad: u32,
+    mtime: u64,
+    file_size: u64,
 }
 
 fn pad(n: usize) -> usize {
@@ -44,8 +57,18 @@ fn pad(n: usize) -> usize {
 }
 
 impl Index {
-    pub fn save(path: impl AsRef<Path>, dim: u32, vectors: &[Vec<f32>], paths: &[String]) -> Result<()> {
+    pub fn save(
+        path: impl AsRef<Path>,
+        dim: u32,
+        vectors: &[Vec<f32>],
+        paths: &[String],
+        mtimes: &[u64],
+        file_sizes: &[u64],
+    ) -> Result<()> {
         assert_eq!(vectors.len(), paths.len());
+        assert_eq!(paths.len(), mtimes.len());
+        assert_eq!(paths.len(), file_sizes.len());
+
         let num_records = vectors.len() as u32;
 
         let header_size = std::mem::size_of::<Header>();
@@ -79,7 +102,10 @@ impl Index {
         for v in vectors {
             assert_eq!(v.len(), dim as usize);
             let bytes = unsafe {
-                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * std::mem::size_of::<f32>())
+                std::slice::from_raw_parts(
+                    v.as_ptr() as *const u8,
+                    v.len() * std::mem::size_of::<f32>(),
+                )
             };
             file.write_all(bytes)?;
         }
@@ -93,22 +119,26 @@ impl Index {
         // Write entry table + string data
         let mut string_offset = 0u64;
         let mut string_data = Vec::new();
-        let mut entries: Vec<Entry> = Vec::with_capacity(num_records as usize);
-        for p in paths {
-            entries.push(Entry {
+        let mut entries: Vec<EntryV2> = Vec::with_capacity(num_records as usize);
+
+        for (i, p) in paths.iter().enumerate() {
+            entries.push(EntryV2 {
                 offset: entry_table_offset as u64
-                    + (num_records as u64 * std::mem::size_of::<Entry>() as u64)
+                    + (num_records as u64 * std::mem::size_of::<EntryV2>() as u64)
                     + string_offset,
                 len: p.len() as u32,
                 _pad: 0,
+                mtime: mtimes[i],
+                file_size: file_sizes[i],
             });
             string_data.extend_from_slice(p.as_bytes());
             string_offset += p.len() as u64;
         }
+
         let entry_bytes = unsafe {
             std::slice::from_raw_parts(
                 entries.as_ptr() as *const u8,
-                entries.len() * std::mem::size_of::<Entry>(),
+                entries.len() * std::mem::size_of::<EntryV2>(),
             )
         };
         file.write_all(entry_bytes)?;
@@ -127,7 +157,7 @@ impl Index {
         if &header.magic != b"LMDB" {
             anyhow::bail!(IndexError::InvalidMagic);
         }
-        if header.version != VERSION {
+        if header.version != 1 && header.version != VERSION {
             anyhow::bail!(IndexError::UnsupportedVersion {
                 version: header.version,
                 expected: VERSION,
@@ -138,6 +168,7 @@ impl Index {
             mmap,
             num_records: header.num_records,
             dim: header.dim,
+            version: header.version,
         })
     }
 
@@ -158,19 +189,65 @@ impl Index {
         unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, self.dim as usize) }
     }
 
-    pub fn path(&self, idx: u32) -> &str {
+    fn entry_v1(&self, idx: u32) -> EntryV1 {
         let header_size = std::mem::size_of::<Header>();
         let vectors_size = self.num_records as usize * self.dim as usize * std::mem::size_of::<f32>();
         let vectors_offset = pad(header_size);
         let entry_table_offset = pad(vectors_offset + vectors_size);
-        let entry_size = std::mem::size_of::<Entry>();
+        let entry_size = std::mem::size_of::<EntryV1>();
 
         let entry_offset = entry_table_offset + idx as usize * entry_size;
-        let entry: &Entry = unsafe { &*(self.mmap[entry_offset..entry_offset + entry_size].as_ptr() as *const Entry) };
+        unsafe { *(self.mmap[entry_offset..entry_offset + entry_size].as_ptr() as *const EntryV1) }
+    }
 
-        let start = entry.offset as usize;
-        let end = start + entry.len as usize;
-        let bytes = &self.mmap[start..end];
-        std::str::from_utf8(bytes).unwrap()
+    fn entry_v2(&self, idx: u32) -> EntryV2 {
+        let header_size = std::mem::size_of::<Header>();
+        let vectors_size = self.num_records as usize * self.dim as usize * std::mem::size_of::<f32>();
+        let vectors_offset = pad(header_size);
+        let entry_table_offset = pad(vectors_offset + vectors_size);
+        let entry_size = std::mem::size_of::<EntryV2>();
+
+        let entry_offset = entry_table_offset + idx as usize * entry_size;
+        unsafe { *(self.mmap[entry_offset..entry_offset + entry_size].as_ptr() as *const EntryV2) }
+    }
+
+    pub fn path(&self, idx: u32) -> &str {
+        let (offset, len) = if self.version == 1 {
+            let e = self.entry_v1(idx);
+            (e.offset as usize, e.len as usize)
+        } else {
+            let e = self.entry_v2(idx);
+            (e.offset as usize, e.len as usize)
+        };
+        let bytes = &self.mmap[offset..offset + len];
+        std::str::from_utf8(bytes).unwrap_or("")
+    }
+
+    pub fn mtime(&self, idx: u32) -> u64 {
+        if self.version >= 2 {
+            self.entry_v2(idx).mtime
+        } else {
+            0
+        }
+    }
+
+    pub fn file_size(&self, idx: u32) -> u64 {
+        if self.version >= 2 {
+            self.entry_v2(idx).file_size
+        } else {
+            0
+        }
+    }
+
+    pub fn get_cached_records(&self) -> HashMap<String, (u64, u64, Vec<f32>)> {
+        let mut map = HashMap::with_capacity(self.num_records as usize);
+        for i in 0..self.num_records {
+            let p = self.path(i).to_string();
+            let mtime = self.mtime(i);
+            let size = self.file_size(i);
+            let vec = self.vector(i).to_vec();
+            map.insert(p, (mtime, size, vec));
+        }
+        map
     }
 }
